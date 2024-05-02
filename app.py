@@ -1,85 +1,65 @@
 import joblib
 import tensorflow_decision_forests as tfdf
 import pandas as pd
-import os
-import google.cloud.storage as gs
-import numpy as np
+from google.cloud import storage
+from google.oauth2 import service_account
+from flask import Flask, request, jsonify
 
-# Función para cargar el modelo desde Google Cloud Storage
-def load_model_from_gcs(model_file_name):
-    # Ruta del archivo de modelo en GCS
-    aip_storage_uri = os.environ['AIP_STORAGE_URI']  # gs-path to directory with model artifacts
-    aip_storage_uri = aip_storage_uri.replace('gs://', '')
+app = Flask(__name__)
 
-    if aip_storage_uri.endswith('/'):
-        aip_storage_uri = aip_storage_uri[:-1]
-    first_slash = aip_storage_uri.find('/')
-    if first_slash > 0:
-        bucket_name = aip_storage_uri[:first_slash]
-        model_path = aip_storage_uri[first_slash+1:]
+# Configura el cliente de Google Cloud Storage
+credenciales = service_account.Credentials.from_service_account_file('service-account-file.json')
+cliente_almacenamiento = storage.Client(credentials=credenciales)
+nombre_cubo = 'testoneml'  # Nombre del bucket
+cubo = cliente_almacenamiento.bucket(nombre_cubo)
 
-    storage_client = gs.Client()
-    bucket = storage_client.get_bucket(bucket_name)
+# Ruta de acceso al directorio de Cloud Storage donde está almacenado el archivo del modelo exportado
+ruta_modelo_cloud_storage = 'gs://testoneml/model_trained/pre_training/'
 
-    # Descargar el archivo binario del modelo desde GCS
-    blob = bucket.get_blob(f"{model_path}/{model_file_name}")
-    local_file_name = f"{model_file_name}.joblib"
-    blob.download_to_filename(local_file_name)
+# Ruta HTTP para las solicitudes de predicción
+ruta_prediccion_http = "/predict"
 
-    # Cargar el modelo desde el archivo binario
-    loaded_model = joblib.load(local_file_name)
-    return loaded_model
+# Ruta HTTP para las verificaciones de estado
+ruta_verificacion_estado_http = "/health"
 
-# Función para leer el archivo CSV directamente desde Google Cloud Storage
-def read_csv_from_gcs(file_name):
-    # Ruta del archivo CSV en GCS
-    aip_storage_uri = os.environ['AIP_STORAGE_URI']  # gs-path to directory with model artifacts
-    aip_storage_uri = aip_storage_uri.replace('gs://', '')
+@app.route(ruta_prediccion_http, methods=["POST"])
+def prediction():
+    try:
+        # Obtiene los datos JSON de la solicitud
+        datos_json_solicitud = request.get_json()
 
-    if aip_storage_uri.endswith('/'):
-        aip_storage_uri = aip_storage_uri[:-1]
-    first_slash = aip_storage_uri.find('/')
-    if first_slash > 0:
-        bucket_name = aip_storage_uri[:first_slash]
-        csv_path = aip_storage_uri[first_slash+1:]
+        # Obtiene la ruta del CSV de entrada de la solicitud o usa la predeterminada
+        ruta_csv_prueba = request.args.get('test_csv_path', 'inference_dataset/test.csv')
 
-    storage_client = gs.Client()
-    bucket = storage_client.get_bucket(bucket_name)
+        # Descarga el CSV de entrada de Cloud Storage
+        blob_prueba = cubo.blob(ruta_csv_prueba)
+        ruta_local_prueba = 'test.csv'
+        blob_prueba.download_to_filename(ruta_local_prueba)
 
-    # Descargar el archivo CSV desde GCS
-    blob = bucket.get_blob(f"{csv_path}/{file_name}")
-    return pd.read_csv(blob.download_as_text(), index_col=None)
+        # Carga los datos de prueba
+        datos = pd.read_csv(ruta_local_prueba)
 
-# Función para guardar las predicciones en un archivo en Google Cloud Storage
-def save_predictions_to_gcs(predictions, output_file_name):
-    # Ruta del archivo de salida en GCS
-    aip_storage_uri = os.environ['AIP_STORAGE_URI']  # gs-path to directory with model artifacts
-    aip_storage_uri = aip_storage_uri.replace('gs://', '')
+        # Carga el modelo desde Cloud Storage
+        modelo_cargado = joblib.load(ruta_modelo_cloud_storage + 'trained_model.joblib')
 
-    if aip_storage_uri.endswith('/'):
-        aip_storage_uri = aip_storage_uri[:-1]
-    first_slash = aip_storage_uri.find('/')
-    if first_slash > 0:
-        bucket_name = aip_storage_uri[:first_slash]
-        output_path = aip_storage_uri[first_slash+1:]
+        # Realiza predicciones con el modelo cargado
+        conjunto_datos_prueba = tfdf.keras.pd_dataframe_to_tf_dataset(datos, task=tfdf.keras.Task.REGRESSION)
+        predicciones = modelo_cargado.predict(conjunto_datos_prueba)
 
-    storage_client = gs.Client()
-    bucket = storage_client.get_bucket(bucket_name)
+        # Convierte las predicciones a un DataFrame (opcional)
+        dataframe_predicciones = pd.DataFrame(predicciones, columns=['Predicción'])
 
-    # Guardar las predicciones en un archivo CSV en GCS
-    output_data = pd.DataFrame(predictions, columns=["Prediction"])
-    output_blob = bucket.blob(f"{output_path}/{output_file_name}")
-    output_blob.upload_from_string(output_data.to_csv(index=False), content_type='text/csv')
+        # Devuelve las predicciones como JSON
+        return jsonify({"predicciones": predicciones.tolist()}), 200
 
-# Cargar el modelo desde Google Cloud Storage
-loaded_model = load_model_from_gcs("houses_trained_model")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# Leer el archivo CSV directamente desde Google Cloud Storage
-test_data = read_csv_from_gcs("test.csv")
+# Endpoint para la verificación de estado
+@app.route(ruta_verificacion_estado_http, methods=["GET"])
+def health_check():
+    return "OK", 200
 
-# Hacer inferencias con el modelo cargado
-test_ds = tfdf.keras.pd_dataframe_to_tf_dataset(test_data, task=tfdf.keras.Task.REGRESSION)
-predictions = loaded_model.predict(test_ds)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
 
-# Guardar las predicciones en un archivo en Google Cloud Storage
-save_predictions_to_gcs(predictions, "predictions.csv")

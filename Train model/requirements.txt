@@ -1,0 +1,3 @@
+Flask==3.0.3
+XGBoost==1.7.6
+NumPy==1.25.2
